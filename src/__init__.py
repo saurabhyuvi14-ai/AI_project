@@ -17,6 +17,22 @@ from src.tools import (
     SYNTHETIC_SHIPPING_POLICIES,
 )
 from src.agent import SupportAgent
+from src.evaluation import (
+    Case,
+    ExpectedOutcome,
+    EvaluationResult,
+    FailureCategory,
+    Evaluator,
+    evaluate,
+    build_canonical_cases,
+    build_canonical_case_list,
+    calculate_task_success,
+    calculate_tool_failures,
+    calculate_recovery,
+    calculate_safety_violations,
+    calculate_failure_localization_accuracy,
+    calculate_suite_metrics,
+)
 
 __all__ = [
     "AgentConfig",
@@ -34,5 +50,20 @@ __all__ = [
     "SYNTHETIC_ORDERS",
     "SYNTHETIC_SHIPPING_POLICIES",
     "SupportAgent",
+    "Case",
+    "ExpectedOutcome",
+    "EvaluationResult",
+    "FailureCategory",
+    "Evaluator",
+    "evaluate",
+    "build_canonical_cases",
+    "build_canonical_case_list",
+    "calculate_task_success",
+    "calculate_tool_failures",
+    "calculate_recovery",
+    "calculate_safety_violations",
+    "calculate_failure_localization_accuracy",
+    "calculate_suite_metrics",
 ]
+
 
