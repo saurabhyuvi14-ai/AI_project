@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 import re
 import time
 from typing import Any, Dict, List, Optional
@@ -12,6 +13,7 @@ from src.models import (
     ObservableEvent,
     StopReason,
     ToolCallResult,
+    get_default_config,
 )
 from src.tools import OrderLookupTool, ResponseValidationTool, ShippingPolicyLookupTool
 
@@ -27,14 +29,15 @@ WRITE_INTENT_KEYWORDS = [
     "change address",
     "update shipping address",
     "modify items",
-    "delete order"
+    "delete order",
 ]
 
 
 class SupportAgent:
     """
-    Deterministic shop-support agent with configurable limits,
-    observable tracing callbacks, and safety guardrails.
+    Deterministic simulated shop-support agent with configurable limits,
+    observable tracing callbacks, baseline comparison configurations,
+    and strict read-only safety guardrails.
     """
 
     def __init__(
@@ -43,13 +46,17 @@ class SupportAgent:
         tools: Optional[Dict[str, Any]] = None,
         event_callback: Optional[EventCallback] = None,
     ):
-        self.config = config or AgentConfig()
+        self.config = config or get_default_config()
         self.tools = tools or {
             "order_lookup": OrderLookupTool(),
             "shipping_policy_lookup": ShippingPolicyLookupTool(),
             "response_validation": ResponseValidationTool(),
         }
         self.event_callback = event_callback
+
+    @property
+    def version(self) -> str:
+        return self.config.version
 
     def _emit(
         self,
@@ -63,11 +70,12 @@ class SupportAgent:
             event = ObservableEvent(
                 case_id=input_data.case_id,
                 run_id=input_data.run_id,
-                agent_version=input_data.agent_version,
+                agent_version=input_data.agent_version or self.config.version,
                 event_type=event_type,
                 step_index=step_index,
                 payload=payload,
                 tool_name=tool_name,
+                timestamp=datetime.now(timezone.utc).isoformat(),
             )
             self.event_callback(event)
 
@@ -97,7 +105,6 @@ class SupportAgent:
                 error={"error_code": "TOOL_NOT_FOUND", "message": f"Tool '{tool_name}' not available."},
             )
         else:
-            # Respect mock tool execution
             res = tool.execute(parameters, call_id=call_id, simulated_timeout=simulated_timeout)
 
         # Emit tool result & observation
@@ -115,6 +122,15 @@ class SupportAgent:
             {"tool_name": tool_name, "status": res.status, "has_data": bool(res.data)},
             tool_name=tool_name,
         )
+        if res.status == "ERROR":
+            err_code = res.error.get("error_code") if res.error else "TOOL_ERROR"
+            self._emit(
+                input_data,
+                EventType.ERROR,
+                step_index,
+                {"error_code": err_code, "tool_name": tool_name, "error": res.error},
+                tool_name=tool_name,
+            )
         return res
 
     def run(self, input_data: AgentInput) -> AgentResult:
@@ -122,18 +138,25 @@ class SupportAgent:
         step_index = 0
         total_tool_calls = 0
 
-        # Merge config overrides from input context if present
+        # Merge config overrides from input context or tools allowlist path
         cfg = self.config
+        active_version = input_data.agent_version or cfg.version
+
         if input_data.context and "config_overrides" in input_data.context:
             overrides = input_data.context["config_overrides"]
             cfg = AgentConfig(
+                version=overrides.get("version", cfg.version),
                 max_steps=overrides.get("max_steps", cfg.max_steps),
                 max_tool_calls=overrides.get("max_tool_calls", cfg.max_tool_calls),
                 tool_timeout_ms=overrides.get("tool_timeout_ms", cfg.tool_timeout_ms),
                 run_timeout_ms=overrides.get("run_timeout_ms", cfg.run_timeout_ms),
                 retry_count=overrides.get("retry_count", cfg.retry_count),
                 clarification_prompt=overrides.get("clarification_prompt", cfg.clarification_prompt),
+                strict_policy_verification=overrides.get("strict_policy_verification", cfg.strict_policy_verification),
+                validate_response=overrides.get("validate_response", cfg.validate_response),
             )
+            if "version" in overrides:
+                active_version = overrides["version"]
 
         def elapsed_ms() -> float:
             return (time.time() - start_time) * 1000.0
@@ -152,7 +175,7 @@ class SupportAgent:
             result = AgentResult(
                 case_id=input_data.case_id,
                 run_id=input_data.run_id,
-                agent_version=input_data.agent_version,
+                agent_version=active_version,
                 status=status,
                 answer=answer,
                 stop_reason=stop_reason,
@@ -164,6 +187,13 @@ class SupportAgent:
                 error_code=error_code,
                 error={"error_code": error_code, "details": error_details} if error_code else None,
             )
+            if error_code:
+                self._emit(
+                    input_data,
+                    EventType.ERROR,
+                    step_index,
+                    {"error_code": error_code, "status": status, "details": error_details},
+                )
             self._emit(
                 input_data,
                 EventType.SAFE_STOP,
@@ -256,7 +286,7 @@ class SupportAgent:
         # Handle Order Lookup Errors (Unknown Order, Timeout, etc.)
         if order_res.status == "ERROR":
             err_code = order_res.error.get("error_code") if order_res.error else "UNKNOWN_ERROR"
-            
+
             # Retry logic if configured
             if err_code == "TIMEOUT_ERROR" and cfg.retry_count > 0:
                 retries_left = cfg.retry_count
@@ -354,7 +384,7 @@ class SupportAgent:
         order_status = order_data.get("status")
         tracking_status = order_data.get("tracking_status")
 
-        # Conflict 1: Explicit tracking_status vs order_status mismatch
+        # Conflict check: tracking_status vs order_status mismatch
         if tracking_status and order_status == "DELIVERED" and tracking_status != "DELIVERED":
             self._emit(
                 input_data,
@@ -384,8 +414,8 @@ class SupportAgent:
             f"It is shipped via {carrier} ({shipping_method.title()} Shipping, estimated {est_days})."
         )
 
-        # Validate response safely with response_validation tool if limits allow
-        if total_tool_calls < cfg.max_tool_calls and step_index < cfg.max_steps:
+        # Validate response safely with response_validation tool if configured and limits allow
+        if cfg.validate_response and total_tool_calls < cfg.max_tool_calls and step_index < cfg.max_steps:
             step_index += 1
             total_tool_calls += 1
             val_res = self._call_tool(
@@ -399,4 +429,3 @@ class SupportAgent:
                 draft_answer = f"Order {extracted_order_id} is {order_status}."
 
         return finalize(AgentStatus.SUCCESS, draft_answer, StopReason.GOAL_REACHED)
-

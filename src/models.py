@@ -27,18 +27,57 @@ class EventType(str, Enum):
     TOOL_CALL = "TOOL_CALL"
     TOOL_RESULT = "TOOL_RESULT"
     OBSERVATION = "OBSERVATION"
+    ERROR = "ERROR"
     SAFE_STOP = "SAFE_STOP"
     FINAL_STATUS = "FINAL_STATUS"
 
 
 @dataclass
 class AgentConfig:
+    version: str = "v1.0.0"
     max_steps: int = 4
     max_tool_calls: int = 3
     tool_timeout_ms: float = 2000.0
     run_timeout_ms: float = 10000.0
     retry_count: int = 1
     clarification_prompt: str = "Please provide your Order ID (format ORD-XXXXX) so I can assist you."
+    strict_policy_verification: bool = True
+    validate_response: bool = True
+
+
+def get_default_config() -> AgentConfig:
+    """Standard baseline agent configuration (v1.0.0): resilient retries and validation."""
+    return AgentConfig(
+        version="v1.0.0",
+        max_steps=4,
+        max_tool_calls=3,
+        tool_timeout_ms=2000.0,
+        run_timeout_ms=10000.0,
+        retry_count=1,
+        clarification_prompt="Please provide your Order ID (format ORD-XXXXX) so I can assist you.",
+        strict_policy_verification=True,
+        validate_response=True,
+    )
+
+
+def get_baseline_fast_fail_config() -> AgentConfig:
+    """
+    Controlled second agent configuration (v0.9.0-fastfail) for baseline comparison:
+    - Zero tool retries (fails fast on transient timeouts).
+    - Reduced max steps (2).
+    - Skips optional downstream validation tool calls to minimize latency.
+    """
+    return AgentConfig(
+        version="v0.9.0-fastfail",
+        max_steps=2,
+        max_tool_calls=2,
+        tool_timeout_ms=1000.0,
+        run_timeout_ms=5000.0,
+        retry_count=0,
+        clarification_prompt="Please provide your Order ID (format ORD-XXXXX) so I can assist you.",
+        strict_policy_verification=False,
+        validate_response=False,
+    )
 
 
 @dataclass
@@ -87,4 +126,3 @@ class ObservableEvent:
 
 
 EventCallback = Callable[[ObservableEvent], None]
-

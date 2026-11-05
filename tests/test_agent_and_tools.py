@@ -8,6 +8,8 @@ from src.models import (
     EventType,
     ObservableEvent,
     StopReason,
+    get_default_config,
+    get_baseline_fast_fail_config,
 )
 from src.tools import (
     OrderLookupTool,
@@ -46,11 +48,22 @@ class TestSupportAgentAndTools(unittest.TestCase):
         self.assertEqual(result.status, "ERROR")
         self.assertEqual(result.error["error_code"], "ORDER_NOT_FOUND")
 
-    def test_order_lookup_timeout(self):
+    def test_order_lookup_permanent_timeout(self):
         tool = OrderLookupTool()
         result = tool.execute({"order_id": "ORD-TIMEOUT"}, call_id="c3")
         self.assertEqual(result.status, "ERROR")
         self.assertEqual(result.error["error_code"], "TIMEOUT_ERROR")
+
+    def test_order_lookup_transient_timeout_recovery(self):
+        tool = OrderLookupTool()
+        # 1st call fails
+        res1 = tool.execute({"order_id": "ORD-TIMEOUT-TRANSIENT"}, call_id="c3a")
+        self.assertEqual(res1.status, "ERROR")
+        self.assertEqual(res1.error["error_code"], "TIMEOUT_ERROR")
+        # 2nd call succeeds
+        res2 = tool.execute({"order_id": "ORD-TIMEOUT-TRANSIENT"}, call_id="c3b")
+        self.assertEqual(res2.status, "SUCCESS")
+        self.assertEqual(res2.data["order_id"], "ORD-TIMEOUT-TRANSIENT")
 
     def test_shipping_policy_lookup_success(self):
         tool = ShippingPolicyLookupTool()
@@ -77,7 +90,7 @@ class TestSupportAgentAndTools(unittest.TestCase):
         self.assertFalse(res2.data["is_valid"])
 
     # -------------------------------------------------------------------------
-    # 2. Agent Normal & Failure Behaviors
+    # 2. Agent Normal & Six Planned Situations
     # -------------------------------------------------------------------------
     def test_situation_ordinary_order(self):
         inp = AgentInput(
@@ -90,11 +103,13 @@ class TestSupportAgentAndTools(unittest.TestCase):
 
         self.assertEqual(res.status, AgentStatus.SUCCESS)
         self.assertEqual(res.stop_reason, StopReason.GOAL_REACHED)
+        self.assertEqual(res.agent_version, "v1.0.0")
+        self.assertEqual(res.case_id, "CASE-001")
         self.assertIn("ORD-10001", res.answer)
         self.assertIn("PROCESSING", res.answer)
         self.assertIn("Wireless Keyboard", res.answer)
 
-        # Verify observable tracing events were emitted
+        # Verify observable tracing events were emitted including timestamps
         event_types = [e.event_type for e in self.events]
         self.assertIn(EventType.PLANNING, event_types)
         self.assertIn(EventType.TOOL_CALL, event_types)
@@ -102,6 +117,10 @@ class TestSupportAgentAndTools(unittest.TestCase):
         self.assertIn(EventType.OBSERVATION, event_types)
         self.assertIn(EventType.SAFE_STOP, event_types)
         self.assertIn(EventType.FINAL_STATUS, event_types)
+        for ev in self.events:
+            self.assertIsNotNone(ev.timestamp)
+            self.assertEqual(ev.case_id, "CASE-001")
+            self.assertEqual(ev.agent_version, "v1.0.0")
 
     def test_situation_missing_order_id(self):
         inp = AgentInput(
@@ -120,6 +139,12 @@ class TestSupportAgentAndTools(unittest.TestCase):
         # Safe behavior: zero tool calls should have been made
         self.assertEqual(res.metrics["total_tool_calls"], 0)
 
+        # Event emission check
+        event_types = [e.event_type for e in self.events]
+        self.assertIn(EventType.PLANNING, event_types)
+        self.assertIn(EventType.ERROR, event_types)
+        self.assertIn(EventType.SAFE_STOP, event_types)
+
     def test_situation_unknown_order(self):
         inp = AgentInput(
             case_id="CASE-003",
@@ -133,6 +158,10 @@ class TestSupportAgentAndTools(unittest.TestCase):
         self.assertEqual(res.stop_reason, StopReason.ERROR_ABORT)
         self.assertEqual(res.error_code, "ORDER_NOT_FOUND")
         self.assertIn("could not find an order matching 'ORD-99999'", res.answer)
+
+        # Event emission check
+        event_types = [e.event_type for e in self.events]
+        self.assertIn(EventType.ERROR, event_types)
 
     def test_situation_incomplete_tool_result(self):
         inp = AgentInput(
@@ -149,7 +178,7 @@ class TestSupportAgentAndTools(unittest.TestCase):
         self.assertIn("incomplete in our system", res.answer)
 
     def test_situation_tool_timeout(self):
-        # ORD-TIMEOUT triggers simulated timeout in OrderLookupTool
+        # ORD-TIMEOUT triggers permanent simulated timeout in OrderLookupTool
         inp = AgentInput(
             case_id="CASE-005",
             run_id="RUN-005",
@@ -224,7 +253,79 @@ class TestSupportAgentAndTools(unittest.TestCase):
         self.assertEqual(res.stop_reason, StopReason.MAX_TOOL_CALLS)
         self.assertEqual(res.error_code, "MAX_TOOL_CALLS_EXCEEDED")
 
+    def test_run_time_limit_enforcement(self):
+        # 0.0 ms run timeout triggers immediate TIME_EXCEEDED
+        custom_config = AgentConfig(run_timeout_ms=0.0)
+        agent = SupportAgent(config=custom_config)
+        inp = AgentInput(
+            case_id="CASE-010",
+            run_id="RUN-010",
+            agent_version="v1.0.0",
+            user_message="Status of ORD-10001",
+        )
+        res = agent.run(inp)
+        self.assertEqual(res.status, AgentStatus.TIMEOUT)
+        self.assertEqual(res.stop_reason, StopReason.TIME_EXCEEDED)
+        self.assertEqual(res.error_code, "TIMEOUT_ERROR")
+
+    # -------------------------------------------------------------------------
+    # 4. Controlled Second Agent Configuration (Baseline Comparison)
+    # -------------------------------------------------------------------------
+    def test_controlled_second_agent_configuration_behavior_difference(self):
+        """
+        Compares default resilient agent (v1.0.0, retry_count=1)
+        vs. controlled second agent baseline (v0.9.0-fastfail, retry_count=0).
+        When encountering transient tool timeouts (ORD-TIMEOUT-TRANSIENT):
+        - v1.0.0 automatically retries, recovers, and returns SUCCESS.
+        - v0.9.0-fastfail fails immediately without retry and returns TIMEOUT.
+        """
+        default_cfg = get_default_config()
+        fast_fail_cfg = get_baseline_fast_fail_config()
+
+        self.assertEqual(default_cfg.version, "v1.0.0")
+        self.assertEqual(fast_fail_cfg.version, "v0.9.0-fastfail")
+        self.assertEqual(default_cfg.retry_count, 1)
+        self.assertEqual(fast_fail_cfg.retry_count, 0)
+
+        # 1. Run baseline agent (v0.9.0-fastfail) on transient timeout order
+        fast_fail_tool = OrderLookupTool()
+        fast_fail_agent = SupportAgent(
+            config=fast_fail_cfg,
+            tools={"order_lookup": fast_fail_tool, "shipping_policy_lookup": ShippingPolicyLookupTool(), "response_validation": ResponseValidationTool()}
+        )
+        inp_fast_fail = AgentInput(
+            case_id="CASE-BASELINE-COMPARE",
+            run_id="RUN-FASTFAIL-001",
+            agent_version=fast_fail_cfg.version,
+            user_message="Status of ORD-TIMEOUT-TRANSIENT please.",
+        )
+        res_fast_fail = fast_fail_agent.run(inp_fast_fail)
+
+        self.assertEqual(res_fast_fail.status, AgentStatus.TIMEOUT)
+        self.assertEqual(res_fast_fail.stop_reason, StopReason.TIME_EXCEEDED)
+        self.assertEqual(res_fast_fail.agent_version, "v0.9.0-fastfail")
+        self.assertEqual(res_fast_fail.metrics["total_tool_calls"], 1)
+
+        # 2. Run resilient default agent (v1.0.0) on fresh transient timeout tool
+        resilient_tool = OrderLookupTool()
+        resilient_agent = SupportAgent(
+            config=default_cfg,
+            tools={"order_lookup": resilient_tool, "shipping_policy_lookup": ShippingPolicyLookupTool(), "response_validation": ResponseValidationTool()}
+        )
+        inp_resilient = AgentInput(
+            case_id="CASE-BASELINE-COMPARE",
+            run_id="RUN-RESILIENT-001",
+            agent_version=default_cfg.version,
+            user_message="Status of ORD-TIMEOUT-TRANSIENT please.",
+        )
+        res_resilient = resilient_agent.run(inp_resilient)
+
+        self.assertEqual(res_resilient.status, AgentStatus.SUCCESS)
+        self.assertEqual(res_resilient.stop_reason, StopReason.GOAL_REACHED)
+        self.assertEqual(res_resilient.agent_version, "v1.0.0")
+        self.assertGreater(res_resilient.metrics["total_tool_calls"], 1)
+        self.assertIn("ORD-TIMEOUT-TRANSIENT", res_resilient.answer)
+
 
 if __name__ == "__main__":
     unittest.main()
-

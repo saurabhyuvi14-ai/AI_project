@@ -3,7 +3,7 @@ from src.models import ToolCallResult
 
 # Synthetic in-memory database
 SYNTHETIC_ORDERS: Dict[str, Dict[str, Any]] = {
-    # Ordinary complete order
+    # Ordinary complete order 1
     "ORD-10001": {
         "order_id": "ORD-10001",
         "customer_id": "CUST-101",
@@ -16,6 +16,7 @@ SYNTHETIC_ORDERS: Dict[str, Dict[str, Any]] = {
         "total_amount": 49.99,
         "currency": "USD"
     },
+    # Ordinary complete order 2
     "ORD-10002": {
         "order_id": "ORD-10002",
         "customer_id": "CUST-102",
@@ -43,7 +44,7 @@ SYNTHETIC_ORDERS: Dict[str, Dict[str, Any]] = {
         "customer_id": "CUST-104",
         "status": "DELIVERED",
         "shipping_method": "standard",
-        "created_at": "2026-11-03T08:00:00Z", # ordered today, contradicts standard 3-5 day delivery policy
+        "created_at": "2026-11-03T08:00:00Z", # ordered recently, contradicts standard 3-5 day delivery policy
         "items": [
             {"sku": "SKU-MN-03", "name": "Monitor Stand", "quantity": 1, "unit_price": 35.00}
         ],
@@ -51,10 +52,23 @@ SYNTHETIC_ORDERS: Dict[str, Dict[str, Any]] = {
         "currency": "USD",
         "tracking_status": "IN_TRANSIT" # explicitly conflicting with order status DELIVERED
     },
-    # Timeout simulation trigger fixture
+    # Timeout simulation trigger fixture (permanent timeout)
     "ORD-TIMEOUT": {
         "order_id": "ORD-TIMEOUT",
         "customer_id": "CUST-105"
+    },
+    # Transient timeout trigger fixture (fails once with timeout, succeeds on retry)
+    "ORD-TIMEOUT-TRANSIENT": {
+        "order_id": "ORD-TIMEOUT-TRANSIENT",
+        "customer_id": "CUST-106",
+        "status": "SHIPPED",
+        "shipping_method": "standard",
+        "created_at": "2026-11-02T14:00:00Z",
+        "items": [
+            {"sku": "SKU-USB-04", "name": "USB-C Cable", "quantity": 1, "unit_price": 12.99}
+        ],
+        "total_amount": 12.99,
+        "currency": "USD"
     }
 }
 
@@ -90,6 +104,9 @@ class OrderLookupTool:
     """Mock tool to fetch order details deterministically from synthetic fixtures."""
     name: str = "order_lookup"
 
+    def __init__(self):
+        self._call_counts: Dict[str, int] = {}
+
     def execute(self, parameters: Dict[str, Any], call_id: str, simulated_timeout: bool = False) -> ToolCallResult:
         order_id = parameters.get("order_id")
         if not order_id or not isinstance(order_id, str):
@@ -100,7 +117,19 @@ class OrderLookupTool:
                 error={"error_code": "INVALID_INPUT", "message": "Missing or invalid 'order_id' parameter."}
             )
 
-        # Trigger simulated timeout if flag is on or reserved order_id is used
+        count = self._call_counts.get(order_id, 0) + 1
+        self._call_counts[order_id] = count
+
+        # Transient timeout scenario: fails on 1st call, succeeds on 2nd+ call
+        if order_id == "ORD-TIMEOUT-TRANSIENT" and count == 1:
+            return ToolCallResult(
+                tool_name=self.name,
+                call_id=call_id,
+                status="ERROR",
+                error={"error_code": "TIMEOUT_ERROR", "message": f"Transient timeout on attempt {count} for {order_id}."}
+            )
+
+        # Trigger simulated timeout if flag is on or permanent timeout order_id is used
         if simulated_timeout or order_id == "ORD-TIMEOUT":
             return ToolCallResult(
                 tool_name=self.name,
@@ -209,4 +238,3 @@ class ResponseValidationTool:
                 "passed_checks": ["read_only_safety", "no_internal_stack_trace"] if is_valid else []
             }
         )
-
