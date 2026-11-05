@@ -7,9 +7,18 @@ import json
 import os
 import sqlite3
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import List, Optional
+
+# ── Constants ────────────────────────────────────────────────────────────────
+
+# Distinguishes the original (baseline) agent configuration from a repair candidate.
+CONFIG_ROLE_ORIGINAL = "original"
+CONFIG_ROLE_CANDIDATE = "candidate"
+
+# Run status while the agent is still executing (terminal values are AgentStatus).
+RUN_STATUS_RUNNING = "RUNNING"
 
 # ── Typed Records ────────────────────────────────────────────────────────────
 
@@ -18,11 +27,17 @@ class RunRecord:
     run_id: str
     case_id: str
     agent_version: str
-    status: str            # AgentStatus value
+    status: str            # AgentStatus value or RUN_STATUS_RUNNING
     start_time: str        # ISO-8601 UTC
     end_time: Optional[str] = None
     final_output: Optional[str] = None
     error_code: Optional[str] = None
+    error_details: Optional[str] = None     # JSON string
+    stop_reason: Optional[str] = None       # StopReason value
+    metrics: Optional[str] = None           # JSON string
+    config_role: Optional[str] = None       # CONFIG_ROLE_ORIGINAL | CONFIG_ROLE_CANDIDATE
+    config_snapshot: Optional[str] = None   # JSON string of the effective AgentConfig
+    baseline_run_id: Optional[str] = None   # candidate run -> original run it is compared to
 
 @dataclass
 class TraceEvent:
@@ -31,13 +46,14 @@ class TraceEvent:
     sequence_no: int
     timestamp: str         # ISO-8601 UTC
     event_type: str        # EventType value
-    stage: Optional[str] = None       # step/stage label e.g. "step_1"
+    stage: Optional[str] = None       # lifecycle label e.g. "tool_start", "run_completed"
     tool_name: Optional[str] = None
     input: Optional[str] = None       # JSON string
     output: Optional[str] = None      # JSON string
     status: Optional[str] = None      # "SUCCESS" | "ERROR" | None
     duration_ms: Optional[float] = None
     error_code: Optional[str] = None
+    step_index: Optional[int] = None  # agent step the event belongs to
 
 @dataclass
 class EvaluationRecord:
@@ -51,10 +67,78 @@ class EvaluationRecord:
     evidence_event_ids: Optional[str] = None   # JSON list of event_ids
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
+@dataclass
+class RunTrace:
+    """A stored run together with its events in sequence order."""
+    run: RunRecord
+    events: List[TraceEvent]
+
 # ── DB Helpers ───────────────────────────────────────────────────────────────
 
+_RUN_COLUMNS = (
+    "run_id", "case_id", "agent_version", "status", "start_time", "end_time",
+    "final_output", "error_code", "error_details", "stop_reason", "metrics",
+    "config_role", "config_snapshot", "baseline_run_id",
+)
+
+_EVENT_COLUMNS = (
+    "event_id", "run_id", "sequence_no", "timestamp", "event_type", "stage",
+    "tool_name", "input", "output", "status", "duration_ms", "error_code",
+    "step_index",
+)
+
+# Columns added after the Day 2 schema; applied to existing databases by init_db.
+_MIGRATIONS = {
+    "runs": (
+        ("error_details", "TEXT"),
+        ("stop_reason", "TEXT"),
+        ("metrics", "TEXT"),
+        ("config_role", "TEXT"),
+        ("config_snapshot", "TEXT"),
+        ("baseline_run_id", "TEXT"),
+    ),
+    "events": (
+        ("step_index", "INTEGER"),
+    ),
+}
+
+
+def _connect(db_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _row_value(row: sqlite3.Row, key: str):
+    return row[key] if key in row.keys() else None
+
+
+def _run_from_row(row: sqlite3.Row) -> RunRecord:
+    return RunRecord(**{col: _row_value(row, col) for col in _RUN_COLUMNS})
+
+
+def _event_from_row(row: sqlite3.Row) -> TraceEvent:
+    return TraceEvent(**{col: _row_value(row, col) for col in _EVENT_COLUMNS})
+
+
+def _insert_run(conn: sqlite3.Connection, run: RunRecord) -> None:
+    conn.execute(
+        f"INSERT OR REPLACE INTO runs ({', '.join(_RUN_COLUMNS)}) "
+        f"VALUES ({', '.join('?' for _ in _RUN_COLUMNS)})",
+        tuple(getattr(run, col) for col in _RUN_COLUMNS),
+    )
+
+
+def _insert_event(conn: sqlite3.Connection, event: TraceEvent) -> None:
+    conn.execute(
+        f"INSERT INTO events ({', '.join(_EVENT_COLUMNS)}) "
+        f"VALUES ({', '.join('?' for _ in _EVENT_COLUMNS)})",
+        tuple(getattr(event, col) for col in _EVENT_COLUMNS),
+    )
+
+
 def init_db(db_path: str) -> None:
-    """Create tables if they don't exist."""
+    """Create tables and indexes if they don't exist, and add any missing columns."""
     dirname = os.path.dirname(db_path)
     if dirname:
         os.makedirs(dirname, exist_ok=True)
@@ -63,14 +147,20 @@ def init_db(db_path: str) -> None:
     with conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS runs (
-                run_id        TEXT PRIMARY KEY,
-                case_id       TEXT NOT NULL,
-                agent_version TEXT NOT NULL,
-                status        TEXT NOT NULL,
-                start_time    TEXT NOT NULL,
-                end_time      TEXT,
-                final_output  TEXT,
-                error_code    TEXT
+                run_id          TEXT PRIMARY KEY,
+                case_id         TEXT NOT NULL,
+                agent_version   TEXT NOT NULL,
+                status          TEXT NOT NULL,
+                start_time      TEXT NOT NULL,
+                end_time        TEXT,
+                final_output    TEXT,
+                error_code      TEXT,
+                error_details   TEXT,
+                stop_reason     TEXT,
+                metrics         TEXT,
+                config_role     TEXT,
+                config_snapshot TEXT,
+                baseline_run_id TEXT
             )
         """)
         conn.execute("""
@@ -87,6 +177,7 @@ def init_db(db_path: str) -> None:
                 status      TEXT,
                 duration_ms REAL,
                 error_code  TEXT,
+                step_index  INTEGER,
                 UNIQUE (run_id, sequence_no)
             )
         """)
@@ -103,6 +194,13 @@ def init_db(db_path: str) -> None:
                 created_at         TEXT NOT NULL
             )
         """)
+        for table, columns in _MIGRATIONS.items():
+            existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for name, col_type in columns:
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {col_type}")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_case ON runs (case_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_version ON runs (agent_version)")
     conn.close()
 
 
@@ -110,97 +208,106 @@ def save_run(db_path: str, run: RunRecord) -> None:
     """Insert or replace a RunRecord."""
     conn = sqlite3.connect(db_path)
     with conn:
-        conn.execute("""
-            INSERT OR REPLACE INTO runs
-                (run_id, case_id, agent_version, status, start_time, end_time, final_output, error_code)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            run.run_id,
-            run.case_id,
-            run.agent_version,
-            run.status,
-            run.start_time,
-            run.end_time,
-            run.final_output,
-            run.error_code,
-        ))
+        _insert_run(conn, run)
     conn.close()
 
 
 def save_event(db_path: str, event: TraceEvent) -> None:
-    """Insert a TraceEvent."""
+    """Insert a TraceEvent; raises IntegrityError on duplicate (run_id, sequence_no)."""
     conn = sqlite3.connect(db_path)
     with conn:
-        conn.execute("""
-            INSERT INTO events
-                (event_id, run_id, sequence_no, timestamp, event_type, stage,
-                 tool_name, input, output, status, duration_ms, error_code)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            event.event_id,
-            event.run_id,
-            event.sequence_no,
-            event.timestamp,
-            event.event_type,
-            event.stage,
-            event.tool_name,
-            event.input,
-            event.output,
-            event.status,
-            event.duration_ms,
-            event.error_code,
-        ))
+        _insert_event(conn, event)
     conn.close()
+
+
+def save_run_trace(db_path: str, run: RunRecord, events: List[TraceEvent]) -> None:
+    """Atomically store a run and replace its events. Either everything is saved or nothing."""
+    init_db(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        with conn:
+            _insert_run(conn, run)
+            conn.execute("DELETE FROM events WHERE run_id = ?", (run.run_id,))
+            for event in events:
+                if event.run_id != run.run_id:
+                    raise ValueError(
+                        f"event {event.event_id!r} belongs to run {event.run_id!r}, not {run.run_id!r}"
+                    )
+                _insert_event(conn, event)
+    finally:
+        conn.close()
 
 
 def load_trace(db_path: str, run_id: str) -> tuple:
     """Return (RunRecord, list[TraceEvent]) ordered by sequence_no ASC."""
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-
-    run_row = conn.execute(
-        "SELECT * FROM runs WHERE run_id = ?", (run_id,)
-    ).fetchone()
-
-    if run_row is None:
+    conn = _connect(db_path)
+    try:
+        run_row = conn.execute(
+            "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        if run_row is None:
+            return (None, [])
+        event_rows = conn.execute(
+            "SELECT * FROM events WHERE run_id = ? ORDER BY sequence_no ASC", (run_id,)
+        ).fetchall()
+        return (_run_from_row(run_row), [_event_from_row(row) for row in event_rows])
+    finally:
         conn.close()
-        return (None, [])
 
-    run = RunRecord(
-        run_id=run_row["run_id"],
-        case_id=run_row["case_id"],
-        agent_version=run_row["agent_version"],
-        status=run_row["status"],
-        start_time=run_row["start_time"],
-        end_time=run_row["end_time"],
-        final_output=run_row["final_output"],
-        error_code=run_row["error_code"],
-    )
 
-    event_rows = conn.execute(
-        "SELECT * FROM events WHERE run_id = ? ORDER BY sequence_no ASC", (run_id,)
-    ).fetchall()
+def get_run_trace(db_path: str, run_id: str) -> Optional[RunTrace]:
+    """Return the run and its events in sequence order, or None if the run is unknown."""
+    if not os.path.exists(db_path):
+        return None
+    run, events = load_trace(db_path, run_id)
+    if run is None:
+        return None
+    return RunTrace(run=run, events=events)
 
-    events = [
-        TraceEvent(
-            event_id=row["event_id"],
-            run_id=row["run_id"],
-            sequence_no=row["sequence_no"],
-            timestamp=row["timestamp"],
-            event_type=row["event_type"],
-            stage=row["stage"],
-            tool_name=row["tool_name"],
-            input=row["input"],
-            output=row["output"],
-            status=row["status"],
-            duration_ms=row["duration_ms"],
-            error_code=row["error_code"],
-        )
-        for row in event_rows
-    ]
 
-    conn.close()
-    return (run, events)
+def list_runs(
+    db_path: str,
+    case_id: Optional[str] = None,
+    agent_version: Optional[str] = None,
+    config_role: Optional[str] = None,
+) -> List[RunRecord]:
+    """List stored runs (oldest first), optionally filtered by case, version, or config role."""
+    if not os.path.exists(db_path):
+        return []
+    clauses, params = [], []
+    for column, value in (
+        ("case_id", case_id), ("agent_version", agent_version), ("config_role", config_role)
+    ):
+        if value is not None:
+            clauses.append(f"{column} = ?")
+            params.append(value)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            f"SELECT * FROM runs{where} ORDER BY start_time ASC, run_id ASC", params
+        ).fetchall()
+        return [_run_from_row(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def _parse_json(value: Optional[str]):
+    return json.loads(value) if value is not None else None
+
+
+def run_trace_to_dict(trace: RunTrace) -> dict:
+    """Plain, JSON-ready view of a stored run for the UI (JSON columns decoded)."""
+    run = asdict(trace.run)
+    for key in ("error_details", "metrics", "config_snapshot"):
+        run[key] = _parse_json(run[key])
+    events = []
+    for event in trace.events:
+        item = asdict(event)
+        item["input"] = _parse_json(item["input"])
+        item["output"] = _parse_json(item["output"])
+        events.append(item)
+    return {"run": run, "events": events}
 
 
 def save_evaluation(db_path: str, evaluation: EvaluationRecord) -> None:

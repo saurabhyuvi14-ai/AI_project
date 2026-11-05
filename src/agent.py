@@ -425,6 +425,17 @@ class SupportAgent:
                 step_index,
                 input_data,
             )
+            self._emit(
+                input_data,
+                EventType.VALIDATION,
+                step_index,
+                {
+                    "status": val_res.status,
+                    "is_valid": bool(val_res.data.get("is_valid")) if val_res.data else None,
+                    "issues": list(val_res.data.get("issues", [])) if val_res.data else [],
+                },
+                tool_name="response_validation",
+            )
             if val_res.status == "SUCCESS" and not val_res.data.get("is_valid"):
                 draft_answer = f"Order {extracted_order_id} is {order_status}."
 

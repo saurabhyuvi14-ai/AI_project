@@ -3,3 +3,6 @@ __pycache__/
 *$py.class
 .pytest_cache/
 .DS_Store
+
+# Local SQLite trace stores
+*.db
