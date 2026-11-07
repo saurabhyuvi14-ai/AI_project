@@ -65,6 +65,16 @@ class TestSupportAgentAndTools(unittest.TestCase):
         self.assertEqual(res2.status, "SUCCESS")
         self.assertEqual(res2.data["order_id"], "ORD-TIMEOUT-TRANSIENT")
 
+    def test_order_lookup_missing_or_invalid_id(self):
+        tool = OrderLookupTool()
+        res1 = tool.execute({}, call_id="c_none")
+        self.assertEqual(res1.status, "ERROR")
+        self.assertEqual(res1.error["error_code"], "INVALID_INPUT")
+
+        res2 = tool.execute({"order_id": 12345}, call_id="c_not_str")
+        self.assertEqual(res2.status, "ERROR")
+        self.assertEqual(res2.error["error_code"], "INVALID_INPUT")
+
     def test_shipping_policy_lookup_success(self):
         tool = ShippingPolicyLookupTool()
         result = tool.execute({"shipping_method": "standard"}, call_id="c4")
@@ -77,6 +87,16 @@ class TestSupportAgentAndTools(unittest.TestCase):
         self.assertEqual(result.status, "ERROR")
         self.assertEqual(result.error["error_code"], "POLICY_NOT_FOUND")
 
+    def test_shipping_policy_lookup_invalid_or_timeout(self):
+        tool = ShippingPolicyLookupTool()
+        res_invalid = tool.execute({}, call_id="p_inv")
+        self.assertEqual(res_invalid.status, "ERROR")
+        self.assertEqual(res_invalid.error["error_code"], "INVALID_INPUT")
+
+        res_timeout = tool.execute({"shipping_method": "timeout"}, call_id="p_time")
+        self.assertEqual(res_timeout.status, "ERROR")
+        self.assertEqual(res_timeout.error["error_code"], "TIMEOUT_ERROR")
+
     def test_response_validation_tool(self):
         tool = ResponseValidationTool()
         # Safe response
@@ -88,6 +108,16 @@ class TestSupportAgentAndTools(unittest.TestCase):
         res2 = tool.execute({"response_text": "I refunded your card."}, call_id="c7")
         self.assertEqual(res2.status, "SUCCESS")
         self.assertFalse(res2.data["is_valid"])
+
+        # Invalid input
+        res3 = tool.execute({}, call_id="c8")
+        self.assertEqual(res3.status, "ERROR")
+        self.assertEqual(res3.error["error_code"], "INVALID_INPUT")
+
+        # Simulated timeout
+        res4 = tool.execute({"response_text": "ok"}, call_id="c9", simulated_timeout=True)
+        self.assertEqual(res4.status, "ERROR")
+        self.assertEqual(res4.error["error_code"], "TIMEOUT_ERROR")
 
     # -------------------------------------------------------------------------
     # 2. Agent Normal & Six Planned Situations

@@ -467,7 +467,7 @@ def _cause_for(category: FailureCategory) -> str:
         FailureCategory.TOOL_TIMEOUT: "Hypothesis: a tool timeout contributed to the failed run.",
         FailureCategory.MISSING_INFORMATION: "Hypothesis: required order information was missing before lookup.",
         FailureCategory.MISSING_ORDER_ID: "Hypothesis: the lookup was attempted with a missing order ID.",
-        FailureCategory.UNKNOWN_ORDER: "Hypothesis: the supplied order ID was not found by the lookup.",
+        FailureCategory.UNKNOWN_ORDER: "Hypothesis: the supplied order ID was not found by the lookup (ORDER_NOT_FOUND).",
         FailureCategory.INCOMPLETE_TOOL_RESULT: "Hypothesis: a tool returned an incomplete result.",
         FailureCategory.MALFORMED_RESULT: "Hypothesis: a tool returned malformed or incomplete data.",
         FailureCategory.CONFLICTING_INFORMATION: "Hypothesis: trace events contain conflicting status values.",
