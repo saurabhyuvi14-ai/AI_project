@@ -121,3 +121,22 @@ run, a 1,000-event trace limit per run, a two-second timeout per tool call, at
 most three selected runs, and a ten-second wall-clock limit per diagnosis.
 Repair generation and regression testing are not part of diagnosis, and
 diagnosis cannot modify a live agent.
+
+## 11. Implemented isolated candidate review
+
+`agentops/repair.py` validates candidates against the retry and clarification
+allowlist, source-run provenance, and available trace evidence. Evidence can be
+provided as an event-to-run mapping to enforce that citations belong to one of
+the candidate's source runs. Applying a candidate deep-copies the supplied
+configuration and never changes the original.
+
+`review_candidate` accepts baseline results and an evaluator that receives only
+a disposable candidate configuration and a case ID. It retests the failed case
+and each unique regression case once, under a ten-second per-case and
+120-second overall limit, with a 100-case cap. The evaluator must execute in an
+isolated test environment; this module has no live-agent or promotion
+interface. The review rejects a still-failing target case, a newly failing
+previously-passing regression, safety failures, invalid baseline data, and
+incomplete or timed-out evaluation. A successful candidate remains pending
+human approval. `decide_repair_review` records that approval or rejection but
+does not apply settings to the original configuration.

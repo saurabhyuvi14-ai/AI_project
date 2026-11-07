@@ -16,8 +16,12 @@ from agentops.repair import (
     ApprovalStatus,
     CandidateTestStatus,
     CandidateValidationError,
+    EvaluationResult,
     RepairCandidate,
+    RepairReviewStatus,
     apply_candidate_to_copy,
+    decide_repair_review,
+    review_candidate,
     validate_candidate,
 )
 
@@ -249,7 +253,8 @@ class DiagnosisTests(unittest.TestCase):
     def test_aborts_when_a_read_only_tool_exceeds_its_time_limit(self):
         tools = FakeReadOnlyTools(None, None)
 
-        def slow_inspection(run_id):
+        def slow_inspection(_run_id):
+            self.assertEqual(_run_id, "run-1")
             time.sleep(0.05)
             return None
 
@@ -298,6 +303,41 @@ class RepairTests(unittest.TestCase):
         values.update(overrides)
         return RepairCandidate(**values)
 
+    def baseline_results(self):
+        return (
+            EvaluationResult("failed-case", False, True, ("baseline failure",)),
+            (
+                EvaluationResult("regression-1", True, True),
+                EvaluationResult("regression-2", True, True),
+            ),
+        )
+
+    def reviewer(self, outcomes):
+        class FakeEvaluator:
+            def __init__(self):
+                self.calls = []
+
+            def evaluate_case(inner_self, settings, case_id):
+                inner_self.calls.append(case_id)
+                self.assertIsNot(settings, self.settings)
+                self.assertEqual(
+                    settings["tools"]["lookup_order_details"]["retry_count"], 1
+                )
+                return outcomes[case_id]
+
+        evaluator = FakeEvaluator()
+        failed_before, regression_before = self.baseline_results()
+        review = review_candidate(
+            self.candidate(),
+            self.settings,
+            self.available_runs,
+            {"evt-17": "run-1"},
+            failed_before,
+            regression_before,
+            evaluator,
+        )
+        return review, evaluator
+
     def test_valid_retry_candidate_applies_to_a_copy_only(self):
         candidate = self.candidate()
 
@@ -313,6 +353,155 @@ class RepairTests(unittest.TestCase):
         self.assertEqual(self.settings["tools"]["lookup_order_details"]["retry_count"], 0)
         self.assertIsNot(copied_settings, self.settings)
         self.assertIsNot(copied_settings["tools"], self.settings["tools"])
+
+    def test_retests_copy_compares_results_and_waits_for_human_approval(self):
+        outcomes = {
+            "failed-case": EvaluationResult("failed-case", True, True),
+            "regression-1": EvaluationResult("regression-1", True, True),
+            "regression-2": EvaluationResult("regression-2", True, True),
+        }
+
+        review, evaluator = self.reviewer(outcomes)
+
+        self.assertEqual(review.status, RepairReviewStatus.PENDING_APPROVAL)
+        self.assertEqual(review.candidate.test_status, CandidateTestStatus.PASSED)
+        self.assertEqual(review.candidate.approval_status, ApprovalStatus.PENDING)
+        self.assertTrue(review.failed_case_after.passed)
+        self.assertEqual(
+            tuple(item.case_id for item in review.regression_after),
+            ("regression-1", "regression-2"),
+        )
+        self.assertEqual(
+            evaluator.calls, ["failed-case", "regression-1", "regression-2"]
+        )
+        self.assertEqual(
+            self.settings["tools"]["lookup_order_details"]["retry_count"], 0
+        )
+
+        approved = decide_repair_review(review, approved=True)
+
+        self.assertEqual(approved.status, RepairReviewStatus.APPROVED)
+        self.assertEqual(approved.candidate.approval_status, ApprovalStatus.APPROVED)
+        self.assertEqual(
+            self.settings["tools"]["lookup_order_details"]["retry_count"], 0
+        )
+
+    def test_rejects_repair_that_still_fails_original_case(self):
+        outcomes = {
+            "failed-case": EvaluationResult("failed-case", False, True),
+            "regression-1": EvaluationResult("regression-1", True, True),
+            "regression-2": EvaluationResult("regression-2", True, True),
+        }
+
+        review, _ = self.reviewer(outcomes)
+
+        self.assertEqual(review.status, RepairReviewStatus.REJECTED)
+        self.assertEqual(review.candidate.test_status, CandidateTestStatus.FAILED)
+        self.assertEqual(review.candidate.approval_status, ApprovalStatus.REJECTED)
+        self.assertTrue(any("still fails" in item for item in review.rejection_reasons))
+
+    def test_does_not_retest_failed_case_twice_when_suite_includes_it(self):
+        class RecordingEvaluator:
+            def __init__(self):
+                self.calls = []
+
+            def evaluate_case(self, _settings, case_id):
+                if _settings["tools"]["lookup_order_details"]["retry_count"] != 1:
+                    raise AssertionError("Evaluator did not receive the candidate copy.")
+                self.calls.append(case_id)
+                return EvaluationResult(case_id, True, True)
+
+        evaluator = RecordingEvaluator()
+        failed_before = EvaluationResult("failed-case", False, True)
+        regression_before = (
+            failed_before,
+            EvaluationResult("regression-1", True, True),
+        )
+
+        review = review_candidate(
+            self.candidate(),
+            self.settings,
+            self.available_runs,
+            {"evt-17": "run-1"},
+            failed_before,
+            regression_before,
+            evaluator,
+        )
+
+        self.assertEqual(review.status, RepairReviewStatus.PENDING_APPROVAL)
+        self.assertEqual(evaluator.calls, ["failed-case", "regression-1"])
+        self.assertEqual(len(review.regression_after), 2)
+
+    def test_rejects_regressive_suite_or_safety_result(self):
+        regressive = {
+            "failed-case": EvaluationResult("failed-case", True, True),
+            "regression-1": EvaluationResult("regression-1", False, True),
+            "regression-2": EvaluationResult("regression-2", True, True),
+        }
+        review, _ = self.reviewer(regressive)
+        self.assertEqual(review.status, RepairReviewStatus.REJECTED)
+        self.assertTrue(any("regression-1" in item for item in review.rejection_reasons))
+
+        unsafe = {
+            "failed-case": EvaluationResult("failed-case", True, False),
+            "regression-1": EvaluationResult("regression-1", True, True),
+            "regression-2": EvaluationResult("regression-2", True, True),
+        }
+        unsafe_review, _ = self.reviewer(unsafe)
+        self.assertEqual(
+            unsafe_review.candidate.test_status, CandidateTestStatus.SAFETY_REGRESSION
+        )
+        self.assertEqual(unsafe_review.candidate.approval_status, ApprovalStatus.REJECTED)
+
+    def test_rejects_evidence_event_from_an_unselected_source_run(self):
+        result = validate_candidate(
+            self.candidate(),
+            self.settings,
+            {"run-1", "run-2"},
+            {"evt-17": "run-2"},
+        )
+
+        self.assertFalse(result.valid)
+        self.assertTrue(any("source run" in item for item in result.rejection_reasons))
+
+    def test_human_reviewer_can_reject_and_cannot_approve_failed_candidate(self):
+        outcomes = {
+            "failed-case": EvaluationResult("failed-case", True, True),
+            "regression-1": EvaluationResult("regression-1", True, True),
+            "regression-2": EvaluationResult("regression-2", True, True),
+        }
+        review, _ = self.reviewer(outcomes)
+
+        rejected = decide_repair_review(review, approved=False)
+        self.assertEqual(rejected.status, RepairReviewStatus.REJECTED)
+        self.assertEqual(rejected.candidate.approval_status, ApprovalStatus.REJECTED)
+
+        with self.assertRaises(ValueError):
+            decide_repair_review(rejected, approved=True)
+
+    def test_marks_timed_out_retest_incomplete_and_rejects_it(self):
+        class SlowEvaluator:
+            def evaluate_case(self, _settings, case_id):
+                if _settings["tools"]["lookup_order_details"]["retry_count"] != 1:
+                    raise AssertionError("Evaluator did not receive the candidate copy.")
+                time.sleep(0.05)
+                return EvaluationResult(case_id, True, True)
+
+        failed_before, regression_before = self.baseline_results()
+        with patch("agentops.repair.MAX_RETEST_CASE_SECONDS", 0.01):
+            review = review_candidate(
+                self.candidate(),
+                self.settings,
+                self.available_runs,
+                {"evt-17": "run-1"},
+                failed_before,
+                regression_before,
+                SlowEvaluator(),
+            )
+
+        self.assertEqual(review.status, RepairReviewStatus.REJECTED)
+        self.assertEqual(review.candidate.test_status, CandidateTestStatus.INCOMPLETE)
+        self.assertEqual(review.candidate.approval_status, ApprovalStatus.REJECTED)
 
     def test_rejects_retry_outside_bounded_transitions(self):
         candidate = self.candidate(new_value=3)
@@ -351,6 +540,32 @@ class RepairTests(unittest.TestCase):
 
         self.assertFalse(result.valid)
         self.assertTrue(any("unsupported setting path" in reason for reason in result.rejection_reasons))
+
+    def test_review_rejects_unsupported_candidate_without_running_evaluator(self):
+        class NoRunEvaluator:
+            def evaluate_case(self, _settings, _case_id):
+                if _settings is None or not _case_id:
+                    raise AssertionError("Expected candidate settings and case ID.")
+                raise AssertionError("Invalid candidates must not be evaluated.")
+
+        candidate = self.candidate(setting_path="agent.system_prompt")
+        failed_before, regression_before = self.baseline_results()
+        review = review_candidate(
+            candidate,
+            self.settings,
+            self.available_runs,
+            {"evt-17": "run-1"},
+            failed_before,
+            regression_before,
+            NoRunEvaluator(),
+        )
+
+        self.assertEqual(review.status, RepairReviewStatus.REJECTED)
+        self.assertEqual(review.candidate.approval_status, ApprovalStatus.REJECTED)
+        self.assertEqual(review.candidate.test_status, CandidateTestStatus.NOT_RUN)
+        self.assertTrue(
+            any("unsupported setting path" in item for item in review.rejection_reasons)
+        )
 
     def test_rejects_boolean_retry_setting(self):
         self.settings["tools"]["lookup_order_details"]["retry_count"] = False
