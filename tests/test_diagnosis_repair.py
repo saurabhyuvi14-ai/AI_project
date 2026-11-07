@@ -1,8 +1,11 @@
 import unittest
+import time
+from unittest.mock import patch
 
 from agentops.diagnosis import (
     CaseExpectation,
     DiagnosisRequest,
+    DiagnosisLimitExceeded,
     FailureCategory,
     FailureSummary,
     RunInspection,
@@ -81,6 +84,132 @@ class DiagnosisTests(unittest.TestCase):
         self.assertEqual(result.cited_evidence_event_ids, ("evt-17",))
         self.assertTrue(any("evt-17" in fact for fact in result.observed_facts))
         self.assertEqual(len(tools.calls), 3)
+        self.assertEqual(result.valid_evidence_event_ids, ("evt-17",))
+        self.assertEqual(result.observed_evidence[0].run_id, "run-1")
+        self.assertTrue(result.hypotheses[0].startswith("Hypothesis:"))
+
+    def diagnose_event(self, category, event, safety_constraints=()):
+        tools = FakeReadOnlyTools(
+            RunInspection(
+                run_id="run-1",
+                case_id="case-1",
+                agent_config_version="agent-v1",
+                tool_config_version="tools-v1",
+                started_at="",
+                completed_at="",
+                events=(event,),
+            ),
+            FailureSummary(
+                run_id="run-1",
+                category=category,
+                failed_assertions=("Expected behavior was not met.",),
+                expected="Expected behavior.",
+                actual="Observed failure.",
+            ),
+        )
+        tools.get_case_expectation = lambda case_id: CaseExpectation(
+            case_id=case_id,
+            required_behavior="Respond accurately.",
+            assertions=("Avoid unsupported claims.",),
+            safety_constraints=safety_constraints,
+        )
+        return diagnose(DiagnosisRequest(("run-1",), "Explain the failure."), tools)
+
+    def test_diagnoses_missing_order_id_with_trace_evidence(self):
+        event = TraceEvent(
+            event_id="evt-missing",
+            event_type="tool_call",
+            step=1,
+            tool_name="lookup_order_details",
+            input={},
+        )
+        result = self.diagnose_event(FailureCategory.MISSING_ORDER_ID, event)
+        generalized = self.diagnose_event(FailureCategory.MISSING_INFORMATION, event)
+
+        self.assertIn("missing order ID", result.likely_cause)
+        self.assertEqual(result.valid_evidence_event_ids, ("evt-missing",))
+        self.assertEqual(generalized.valid_evidence_event_ids, ("evt-missing",))
+
+    def test_diagnoses_unknown_order_with_trace_evidence(self):
+        result = self.diagnose_event(
+            FailureCategory.UNKNOWN_ORDER,
+            TraceEvent(
+                event_id="evt-unknown",
+                event_type="tool_call",
+                step=1,
+                tool_name="lookup_order_details",
+                input={"order_id": "ORD-404"},
+                error="ORDER_NOT_FOUND",
+            ),
+        )
+
+        self.assertIn("not found", result.likely_cause)
+        self.assertEqual(result.valid_evidence_event_ids, ("evt-unknown",))
+
+    def test_diagnoses_malformed_and_incomplete_tool_results(self):
+        malformed = self.diagnose_event(
+            FailureCategory.MALFORMED_RESULT,
+            TraceEvent(
+                event_id="evt-malformed",
+                event_type="tool_result",
+                step=1,
+                tool_name="lookup_order_details",
+                output={"order_id": "ORD-1", "status": None},
+            ),
+        )
+        incomplete = self.diagnose_event(
+            FailureCategory.INCOMPLETE_TOOL_RESULT,
+            TraceEvent(
+                event_id="evt-incomplete",
+                event_type="tool_result",
+                step=1,
+                tool_name="get_order_items",
+                output={"order_id": "ORD-1", "items": []},
+            ),
+        )
+
+        self.assertIn("malformed", malformed.likely_cause)
+        self.assertEqual(malformed.valid_evidence_event_ids, ("evt-malformed",))
+        self.assertIn("incomplete", incomplete.likely_cause)
+        self.assertEqual(incomplete.valid_evidence_event_ids, ("evt-incomplete",))
+
+    def test_diagnoses_conflicting_information(self):
+        second = TraceEvent(
+            event_id="evt-transit",
+            event_type="tool_result",
+            step=2,
+            tool_name="track_shipment",
+            output={"shipping_status": "IN_TRANSIT"},
+        )
+        # Include both source events in the same selected run.
+        tools = FakeReadOnlyTools(
+            RunInspection("run-1", "case-1", "", "", "", "", (
+                TraceEvent("evt-delivered", "tool_result", 1, output={"status": "DELIVERED"}),
+                second,
+            )),
+            FailureSummary("run-1", FailureCategory.CONFLICTING_INFORMATION, (), "", ""),
+        )
+        result = diagnose(DiagnosisRequest(("run-1",), "Explain the discrepancy."), tools)
+
+        self.assertIn("conflicting", result.likely_cause)
+        self.assertEqual(
+            result.valid_evidence_event_ids, ("evt-delivered", "evt-transit")
+        )
+
+    def test_diagnoses_unsafe_claim_against_recorded_safety_constraint(self):
+        result = self.diagnose_event(
+            FailureCategory.UNSAFE_CLAIM,
+            TraceEvent(
+                event_id="evt-claim",
+                event_type="assistant_response",
+                step=2,
+                output={"response": "I have cancelled your order."},
+            ),
+            ("Do not cancel orders or claim that a cancellation occurred.",),
+        )
+
+        self.assertIn("safety constraint", result.likely_cause)
+        self.assertEqual(result.valid_evidence_event_ids, ("evt-claim",))
 
     def test_abstains_when_failure_category_has_no_trace_support(self):
         tools = FakeReadOnlyTools(
@@ -106,6 +235,8 @@ class DiagnosisTests(unittest.TestCase):
 
         self.assertIn("Insufficient trace evidence", result.likely_cause)
         self.assertEqual(result.cited_evidence_event_ids, ())
+        self.assertEqual(result.observed_evidence, ())
+        self.assertEqual(result.valid_evidence_event_ids, ())
 
     def test_rejects_more_runs_than_diagnosis_limit(self):
         tools = FakeReadOnlyTools(None, None)
@@ -114,6 +245,31 @@ class DiagnosisTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             diagnose(request, tools)
         self.assertEqual(tools.calls, [])
+
+    def test_aborts_when_a_read_only_tool_exceeds_its_time_limit(self):
+        tools = FakeReadOnlyTools(None, None)
+
+        def slow_inspection(run_id):
+            time.sleep(0.05)
+            return None
+
+        tools.inspect_run = slow_inspection
+        with patch("agentops.diagnosis.TOOL_CALL_TIMEOUT_SECONDS", 0.01):
+            with self.assertRaises(DiagnosisLimitExceeded):
+                diagnose(DiagnosisRequest(("run-1",), "Find cause."), tools)
+        self.assertEqual(tools.calls, [])
+
+    def test_aborts_when_a_trace_exceeds_its_event_limit(self):
+        event = TraceEvent("evt-1", "tool_call", 1)
+        tools = FakeReadOnlyTools(
+            RunInspection("run-1", "case-1", "", "", "", "", (event,)),
+            None,
+        )
+
+        with patch("agentops.diagnosis.MAX_TRACE_EVENTS_PER_RUN", 0):
+            with self.assertRaises(DiagnosisLimitExceeded):
+                diagnose(DiagnosisRequest(("run-1",), "Find cause."), tools)
+        self.assertEqual(tools.calls, [("inspect_run", "run-1")])
 
 
 class RepairTests(unittest.TestCase):
