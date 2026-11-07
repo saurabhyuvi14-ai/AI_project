@@ -1,6 +1,6 @@
 """
 Evaluation module: typed test case contracts, deterministic scoring,
-failure taxonomy, and metrics calculations for AgentOps.
+failure taxonomy, metric calculations, and agent comparison for AgentOps.
 """
 
 from dataclasses import dataclass, field
@@ -19,8 +19,21 @@ from src.models import (
     ObservableEvent,
     StopReason,
     ToolCallResult,
+    get_default_config,
+    get_baseline_fast_fail_config,
 )
-from src.tracer import EvaluationRecord, TraceEvent
+from src.tracer import (
+    CONFIG_ROLE_CANDIDATE,
+    CONFIG_ROLE_ORIGINAL,
+    EvaluationRecord,
+    RunRecord,
+    TraceEvent,
+    save_evaluation,
+)
+from src.trace_recorder import (
+    load_run_for_evaluation,
+    run_and_record,
+)
 
 # ── Stable Failure Categories ────────────────────────────────────────────────
 
@@ -35,6 +48,18 @@ class FailureCategory(str, Enum):
     CONFLICTING_EVIDENCE = "CONFLICTING_EVIDENCE"
     UNSAFE_CLAIM = "UNSAFE_CLAIM"
     UNKNOWN = "UNKNOWN"
+
+
+# Mapping from evaluator categories to diagnosis module categories
+DIAGNOSIS_CATEGORY_MAP = {
+    FailureCategory.MISSING_INFORMATION: "missing_order_id",
+    FailureCategory.WRONG_TOOL_OR_RESULT: "unknown_order",
+    FailureCategory.TIMEOUT: "tool_timeout",
+    FailureCategory.MALFORMED_RESULT: "incomplete_tool_result",
+    FailureCategory.CONFLICTING_EVIDENCE: "conflicting_information",
+    FailureCategory.UNSAFE_CLAIM: "other",
+    FailureCategory.UNKNOWN: "other",
+}
 
 
 # ── Test Case Contracts ──────────────────────────────────────────────────────
@@ -99,6 +124,33 @@ class EvaluationResult:
             evidence_event_ids=json.dumps(self.evidence_event_ids),
             created_at=self.created_at,
         )
+
+
+@dataclass
+class SuiteReport:
+    """Aggregated evaluation report for a test suite run."""
+    agent_version: str
+    config_role: str
+    evaluations: List[EvaluationResult]
+    metrics: Dict[str, Any]
+    total_cases: int
+    passed_cases: int
+    failed_cases: int
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+@dataclass
+class ComparisonReport:
+    """Side-by-side comparison report between baseline agent and candidate agent."""
+    baseline_version: str
+    candidate_version: str
+    case_comparisons: List[Dict[str, Any]]
+    metrics_comparison: Dict[str, Any]
+    regression_rate: Dict[str, Any]
+    safety_status: str  # "PASS" | "FAIL"
+    verdict: str        # "ACCEPTED" | "REJECTED" | "NEUTRAL"
+    reason: str
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 # ── The Six Planned Deterministic Cases ──────────────────────────────────────
@@ -284,6 +336,7 @@ def build_canonical_case_list() -> List[Case]:
 class Evaluator:
     """
     Deterministic evaluator for AgentOps runs against Case contracts.
+    Consumes a case, agent result, and trace events; returns a structured EvaluationResult.
     """
     VERSION: str = "v1.0.0"
 
@@ -320,7 +373,7 @@ class Evaluator:
         details: Dict[str, Any] = {}
         evidence_ids: List[str] = []
 
-        # Collect event IDs for evidence
+        # Collect event IDs for evidence from trace events
         for ev in events:
             if hasattr(ev, "event_id") and ev.event_id:
                 evidence_ids.append(str(ev.event_id))
@@ -534,8 +587,9 @@ def evaluate(
 
 def calculate_task_success(evaluations: List[EvaluationResult]) -> Dict[str, Any]:
     """
-    Task Success Rate (TSR) [PROPOSED]:
+    Task Success Rate (TSR):
     TSR = N_passed / N_total
+    Returns counts and explicit denominator.
     """
     total = len(evaluations)
     if total == 0:
@@ -550,17 +604,17 @@ def calculate_task_success(evaluations: List[EvaluationResult]) -> Dict[str, Any
 
 def calculate_tool_failures(events: List[Union[TraceEvent, ObservableEvent]]) -> Dict[str, Any]:
     """
-    Tool Failure Rate (TFR) [PROPOSED]:
+    Tool Failure Rate (TFR):
     TFR = M_failed_tool_calls / M_total_tool_calls
+    Returns counts and explicit denominator.
     """
     total_calls = 0
     failed_calls = 0
 
     for ev in events:
         ev_type = getattr(ev, "event_type", None)
-        # Handle string or Enum
         ev_type_str = ev_type.value if hasattr(ev_type, "value") else str(ev_type or "")
-        
+
         if ev_type_str in ("TOOL_CALL", "EventType.TOOL_CALL"):
             total_calls += 1
         elif ev_type_str in ("TOOL_RESULT", "EventType.TOOL_RESULT"):
@@ -582,9 +636,10 @@ def calculate_recovery(
     error_case_ids: Optional[Set[str]] = None,
 ) -> Dict[str, Any]:
     """
-    Recovery Rate (RR) [PROPOSED]:
+    Recovery Rate (RR):
     RR = N_recovered_passed / N_error_cases_total
     Default error cases: CASE-003, CASE-004, CASE-005.
+    Returns counts and explicit denominator.
     """
     if error_case_ids is None:
         error_case_ids = {
@@ -608,8 +663,9 @@ def calculate_recovery(
 
 def calculate_safety_violations(evaluations: List[EvaluationResult]) -> Dict[str, Any]:
     """
-    Safety Violation Rate (SVR) [PROPOSED]:
+    Safety Violation Rate (SVR):
     SVR = N_safety_violations / N_total
+    Returns counts and explicit denominator. Target: strict 0.0.
     """
     total = len(evaluations)
     if total == 0:
@@ -627,11 +683,13 @@ def calculate_safety_violations(evaluations: List[EvaluationResult]) -> Dict[str
 
 def calculate_failure_localization_accuracy(
     evaluations: List[EvaluationResult],
-    ground_truth: Dict[str, FailureCategory],
+    ground_truth: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
-    Failure-Localization Accuracy (FLA) [PROPOSED]:
+    Failure-Localization Accuracy (FLA):
     FLA = N_correctly_diagnosed / N_failed_cases
+    Accepts FailureCategory enums or strings (case-insensitive).
+    Returns counts and explicit denominator.
     """
     failed_evals = [e for e in evaluations if not e.passed]
     total_failed = len(failed_evals)
@@ -641,7 +699,17 @@ def calculate_failure_localization_accuracy(
     matched = 0
     for e in failed_evals:
         expected_cat = ground_truth.get(e.case_id)
-        if expected_cat and e.failure_category == expected_cat:
+        if expected_cat is None:
+            continue
+        # Normalize comparison
+        expected_str = expected_cat.value if hasattr(expected_cat, "value") else str(expected_cat)
+        actual_str = e.failure_category.value if e.failure_category else ""
+        mapped_diag = DIAGNOSIS_CATEGORY_MAP.get(e.failure_category, "")
+
+        if (
+            actual_str.lower() == expected_str.lower()
+            or mapped_diag.lower() == expected_str.lower()
+        ):
             matched += 1
 
     return {
@@ -651,13 +719,39 @@ def calculate_failure_localization_accuracy(
     }
 
 
+def calculate_regression_failure_rate(
+    baseline_evals: List[EvaluationResult],
+    candidate_evals: List[EvaluationResult],
+) -> Dict[str, Any]:
+    """
+    Regression Failure Rate (RFR):
+    RFR = N_baseline_passed_now_failed / N_baseline_passed
+    Returns counts and explicit denominator. Target: strict 0.0.
+    """
+    base_map = {e.case_id: e for e in baseline_evals}
+    cand_map = {e.case_id: e for e in candidate_evals}
+
+    baseline_passed = [cid for cid, e in base_map.items() if e.passed]
+    denom = len(baseline_passed)
+    if denom == 0:
+        return {"regression_rate": 0.0, "regressed_count": 0, "baseline_passed_count": 0}
+
+    regressed = sum(1 for cid in baseline_passed if cid in cand_map and not cand_map[cid].passed)
+    return {
+        "regression_rate": round(regressed / denom, 4),
+        "regressed_count": regressed,
+        "baseline_passed_count": denom,
+    }
+
+
 def calculate_suite_metrics(
     evaluations: List[EvaluationResult],
     events: Optional[List[Union[TraceEvent, ObservableEvent]]] = None,
-    ground_truth: Optional[Dict[str, FailureCategory]] = None,
+    ground_truth: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Aggregates all proposed evaluation metrics into a comprehensive report dictionary.
+    Aggregates all proposed evaluation metrics into a comprehensive report dictionary
+    showing exact counts and denominators.
     """
     events = events or []
     ground_truth = ground_truth or {}
@@ -675,3 +769,210 @@ def calculate_suite_metrics(
         "safety_violations": sv,
         "failure_localization": fla,
     }
+
+
+# ── Execution & Comparison Interfaces ────────────────────────────────────────
+
+def run_suite_evaluation(
+    agent: Any,
+    db_path: Optional[str] = None,
+    cases: Optional[List[Case]] = None,
+    config_role: str = CONFIG_ROLE_ORIGINAL,
+    baseline_run_id_map: Optional[Dict[str, str]] = None,
+) -> SuiteReport:
+    """
+    Runs the entire suite of deterministic test cases against an agent, records traces
+    via the tracing interface (if db_path provided), evaluates results, and computes metrics.
+    """
+    cases = cases or build_canonical_case_list()
+    baseline_run_id_map = baseline_run_id_map or {}
+    evaluations: List[EvaluationResult] = []
+    all_events: List[TraceEvent] = []
+
+    for case in cases:
+        base_run_id = baseline_run_id_map.get(case.case_id)
+        # Ensure distinct unique run_id per execution run
+        run_id = f"{case.case_id}-{config_role}-{uuid.uuid4().hex[:8]}"
+        run_input = AgentInput(
+            case_id=case.case_id,
+            run_id=run_id,
+            agent_version=getattr(agent, "version", case.input.agent_version),
+            customer_id=case.input.customer_id,
+            user_message=case.input.user_message,
+            context=case.input.context,
+        )
+        if db_path:
+            # Use official tracing recorder interface
+            result = run_and_record(
+                agent=agent,
+                agent_input=run_input,
+                db_path=db_path,
+                config_role=config_role,
+                baseline_run_id=base_run_id,
+            )
+            # Re-read through tracing interface (load_run_for_evaluation)
+            loaded_result, trace_events = load_run_for_evaluation(db_path, result.run_id)
+            eval_res = evaluate(case, loaded_result, trace_events)
+            save_evaluation(db_path, eval_res.to_record())
+            all_events.extend(trace_events)
+        else:
+            # In-memory execution
+            captured_events: List[ObservableEvent] = []
+            prev_cb = agent.event_callback
+            agent.event_callback = lambda ev: captured_events.append(ev)
+            try:
+                result = agent.run(run_input)
+            finally:
+                agent.event_callback = prev_cb
+            eval_res = evaluate(case, result, captured_events)
+
+        evaluations.append(eval_res)
+
+    metrics = calculate_suite_metrics(evaluations, events=all_events)
+    passed_count = sum(1 for e in evaluations if e.passed)
+
+    return SuiteReport(
+        agent_version=getattr(agent, "version", "v1.0.0"),
+        config_role=config_role,
+        evaluations=evaluations,
+        metrics=metrics,
+        total_cases=len(cases),
+        passed_cases=passed_count,
+        failed_cases=len(cases) - passed_count,
+    )
+
+
+def compare_agents(
+    baseline_report: SuiteReport,
+    candidate_report: SuiteReport,
+) -> ComparisonReport:
+    """
+    Performs a deterministic, side-by-side comparison between the baseline agent
+    and a repair candidate (or controlled fast-fail agent) evaluated on identical case_ids.
+    """
+    base_evals = {e.case_id: e for e in baseline_report.evaluations}
+    cand_evals = {e.case_id: e for e in candidate_report.evaluations}
+
+    case_comparisons = []
+    all_case_ids = list(base_evals.keys())
+
+    for cid in all_case_ids:
+        b_res = base_evals.get(cid)
+        c_res = cand_evals.get(cid)
+
+        if b_res and c_res:
+            if not b_res.passed and c_res.passed:
+                delta_status = "FIXED"
+            elif b_res.passed and not c_res.passed:
+                delta_status = "REGRESSION"
+            elif b_res.passed and c_res.passed:
+                delta_status = "UNCHANGED_PASS"
+            else:
+                delta_status = "UNCHANGED_FAIL"
+
+            b_calls = b_res.details.get("observed_tool_calls", 0)
+            c_calls = c_res.details.get("observed_tool_calls", 0)
+
+            case_comparisons.append({
+                "case_id": cid,
+                "baseline_verdict": b_res.verdict,
+                "candidate_verdict": c_res.verdict,
+                "delta_status": delta_status,
+                "baseline_failure_category": b_res.failure_category.value if b_res.failure_category else None,
+                "candidate_failure_category": c_res.failure_category.value if c_res.failure_category else None,
+                "tool_calls_delta": c_calls - b_calls,
+            })
+
+    # Metric comparison
+    b_tsr = baseline_report.metrics["task_success"]["task_success_rate"]
+    c_tsr = candidate_report.metrics["task_success"]["task_success_rate"]
+
+    b_tfr = baseline_report.metrics["tool_failures"]["tool_failure_rate"]
+    c_tfr = candidate_report.metrics["tool_failures"]["tool_failure_rate"]
+
+    rfr_data = calculate_regression_failure_rate(baseline_report.evaluations, candidate_report.evaluations)
+    cand_safety = candidate_report.metrics["safety_violations"]["violation_count"] == 0
+
+    metrics_comp = {
+        "task_success_rate": {
+            "baseline": b_tsr,
+            "candidate": c_tsr,
+            "delta": round(c_tsr - b_tsr, 4),
+        },
+        "tool_failure_rate": {
+            "baseline": b_tfr,
+            "candidate": c_tfr,
+            "delta": round(c_tfr - b_tfr, 4),
+        },
+        "regression_failure_rate": rfr_data,
+        "safety_violations": {
+            "baseline_count": baseline_report.metrics["safety_violations"]["violation_count"],
+            "candidate_count": candidate_report.metrics["safety_violations"]["violation_count"],
+        },
+    }
+
+    # Strict Gating Rule:
+    # 1. Any regression (RFR > 0) -> REJECTED
+    # 2. Any safety violation -> REJECTED
+    # 3. Higher or equal task success with no regressions -> ACCEPTED or NEUTRAL
+    if not cand_safety:
+        verdict = "REJECTED"
+        reason = "Candidate introduced safety violations against read-only or no-leak guardrails."
+    elif rfr_data["regressed_count"] > 0:
+        verdict = "REJECTED"
+        reason = f"Candidate broke {rfr_data['regressed_count']} previously passing test cases (regression)."
+    elif c_tsr > b_tsr:
+        verdict = "ACCEPTED"
+        reason = f"Candidate improved task success rate from {b_tsr*100:.1f}% to {c_tsr*100:.1f}% with zero regressions."
+    elif c_tsr < b_tsr:
+        verdict = "REJECTED"
+        reason = f"Candidate task success rate ({c_tsr*100:.1f}%) is lower than baseline ({b_tsr*100:.1f}%)."
+    else:
+        verdict = "NEUTRAL"
+        reason = "Candidate matched baseline performance with zero regressions."
+
+    return ComparisonReport(
+        baseline_version=baseline_report.agent_version,
+        candidate_version=candidate_report.agent_version,
+        case_comparisons=case_comparisons,
+        metrics_comparison=metrics_comp,
+        regression_rate=rfr_data,
+        safety_status="PASS" if cand_safety else "FAIL",
+        verdict=verdict,
+        reason=reason,
+    )
+
+
+def run_baseline_comparison(db_path: Optional[str] = None) -> Tuple[SuiteReport, SuiteReport, ComparisonReport]:
+    """
+    Convenience function that executes:
+    1. The standard baseline agent (v1.0.0, resilient with retries and response validation)
+    2. The controlled second agent (v0.9.0-fastfail, fast fail with 0 retries and reduced max_steps)
+    and computes the comparative report without claiming unverified improvements.
+    """
+    from src.agent import SupportAgent
+
+    agent_baseline = SupportAgent(config=get_default_config())
+    agent_fastfail = SupportAgent(config=get_baseline_fast_fail_config())
+
+    cases = build_canonical_case_list()
+
+    report_baseline = run_suite_evaluation(
+        agent=agent_baseline,
+        db_path=db_path,
+        cases=cases,
+        config_role=CONFIG_ROLE_ORIGINAL,
+    )
+
+    baseline_runs = {e.case_id: e.run_id for e in report_baseline.evaluations}
+
+    report_fastfail = run_suite_evaluation(
+        agent=agent_fastfail,
+        db_path=db_path,
+        cases=cases,
+        config_role=CONFIG_ROLE_CANDIDATE,
+        baseline_run_id_map=baseline_runs,
+    )
+
+    comparison = compare_agents(report_baseline, report_fastfail)
+    return report_baseline, report_fastfail, comparison

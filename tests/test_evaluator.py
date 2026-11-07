@@ -11,12 +11,16 @@ from src.models import (
     EventType,
     ObservableEvent,
     StopReason,
+    get_default_config,
+    get_baseline_fast_fail_config,
 )
 from src.agent import SupportAgent
 from src.evaluation import (
     Case,
     ExpectedOutcome,
     EvaluationResult,
+    SuiteReport,
+    ComparisonReport,
     FailureCategory,
     Evaluator,
     evaluate,
@@ -27,14 +31,20 @@ from src.evaluation import (
     calculate_recovery,
     calculate_safety_violations,
     calculate_failure_localization_accuracy,
+    calculate_regression_failure_rate,
     calculate_suite_metrics,
+    run_suite_evaluation,
+    compare_agents,
+    run_baseline_comparison,
 )
 from src.tracer import (
     EvaluationRecord,
     TraceEvent,
     init_db,
     save_evaluation,
+    list_runs,
 )
+from app import format_rate, run_evaluation_data
 
 
 class TestEvaluatorAndCases(unittest.TestCase):
@@ -161,7 +171,6 @@ class TestEvaluatorAndCases(unittest.TestCase):
 
     def test_evaluator_unsafe_claim_detection(self):
         case = self.canonical_cases["CASE-001-ORDINARY"]
-        # Simulate an agent response with unauthorized mutation claim
         bad_result = AgentResult(
             case_id=case.case_id,
             run_id="RUN-BAD-01",
@@ -180,7 +189,6 @@ class TestEvaluatorAndCases(unittest.TestCase):
 
     def test_evaluator_tech_leak_detection(self):
         case = self.canonical_cases["CASE-001-ORDINARY"]
-        # Simulate an agent response leaking stack trace
         leak_result = AgentResult(
             case_id=case.case_id,
             run_id="RUN-LEAK-01",
@@ -197,7 +205,6 @@ class TestEvaluatorAndCases(unittest.TestCase):
 
     def test_evaluator_missing_information_failure(self):
         case = self.canonical_cases["CASE-002-MISSING-ID"]
-        # Simulate agent calling tools when ID was missing
         bad_result = AgentResult(
             case_id=case.case_id,
             run_id="RUN-BAD-02",
@@ -215,7 +222,6 @@ class TestEvaluatorAndCases(unittest.TestCase):
 
     def test_evaluator_timeout_failure(self):
         case = self.canonical_cases["CASE-005-TOOL-TIMEOUT"]
-        # Simulate unhandled timeout
         failed_result = AgentResult(
             case_id=case.case_id,
             run_id="RUN-BAD-05",
@@ -232,7 +238,6 @@ class TestEvaluatorAndCases(unittest.TestCase):
 
     def test_evaluator_malformed_result_failure(self):
         case = self.canonical_cases["CASE-004-INCOMPLETE-RESULT"]
-        # Simulate agent crashing on missing fields
         bad_result = AgentResult(
             case_id=case.case_id,
             run_id="RUN-BAD-04",
@@ -252,7 +257,6 @@ class TestEvaluatorAndCases(unittest.TestCase):
 
     def test_evaluator_conflicting_evidence_failure(self):
         case = self.canonical_cases["CASE-006-CONFLICTING-INFO"]
-        # Simulate agent ignoring the conflict and declaring delivery
         bad_result = AgentResult(
             case_id=case.case_id,
             run_id="RUN-BAD-06",
@@ -268,7 +272,6 @@ class TestEvaluatorAndCases(unittest.TestCase):
 
     def test_evaluator_wrong_tool_or_result_failure(self):
         case = self.canonical_cases["CASE-001-ORDINARY"]
-        # Simulate agent failing to include required keywords
         bad_result = AgentResult(
             case_id=case.case_id,
             run_id="RUN-BAD-07",
@@ -288,12 +291,10 @@ class TestEvaluatorAndCases(unittest.TestCase):
     # -------------------------------------------------------------------------
 
     def test_task_success_rate(self):
-        # Empty evaluations handling
         empty_res = calculate_task_success([])
         self.assertEqual(empty_res["task_success_rate"], 0.0)
         self.assertEqual(empty_res["total_cases"], 0)
 
-        # 4 passed out of 6
         evals = [
             EvaluationResult("e1", "r1", "c1", "PASS", True, 1.0),
             EvaluationResult("e2", "r2", "c2", "PASS", True, 1.0),
@@ -354,6 +355,38 @@ class TestEvaluatorAndCases(unittest.TestCase):
         self.assertEqual(res["failed_cases_total"], 2)
         self.assertEqual(res["localization_accuracy"], 0.5)
 
+    def test_failure_localization_with_diagnosis_mapping(self):
+        evals = [
+            EvaluationResult("e1", "r1", "c1", "FAIL", False, 0.0, failure_category=FailureCategory.TIMEOUT),
+            EvaluationResult("e2", "r2", "c2", "FAIL", False, 0.0, failure_category=FailureCategory.MISSING_INFORMATION),
+        ]
+        # Using string categories from agentops.diagnosis
+        ground_truth_strings = {
+            "c1": "tool_timeout",
+            "c2": "missing_order_id",
+        }
+        res = calculate_failure_localization_accuracy(evals, ground_truth_strings)
+        self.assertEqual(res["matched_count"], 2)
+        self.assertEqual(res["failed_cases_total"], 2)
+        self.assertEqual(res["localization_accuracy"], 1.0)
+
+    def test_calculate_regression_failure_rate(self):
+        baseline_evals = [
+            EvaluationResult("b1", "r1", "c1", "PASS", True, 1.0),
+            EvaluationResult("b2", "r2", "c2", "PASS", True, 1.0),
+            EvaluationResult("b3", "r3", "c3", "FAIL", False, 0.0),
+        ]
+        # Candidate breaks c2 (regression)
+        candidate_evals = [
+            EvaluationResult("c1", "r1", "c1", "PASS", True, 1.0),
+            EvaluationResult("c2", "r2", "c2", "FAIL", False, 0.0),
+            EvaluationResult("c3", "r3", "c3", "PASS", True, 1.0),
+        ]
+        rfr = calculate_regression_failure_rate(baseline_evals, candidate_evals)
+        self.assertEqual(rfr["regressed_count"], 1)
+        self.assertEqual(rfr["baseline_passed_count"], 2)
+        self.assertEqual(rfr["regression_rate"], 0.5)
+
     def test_suite_metrics_aggregation(self):
         evals = [EvaluationResult("e1", "r1", "CASE-001-ORDINARY", "PASS", True, 1.0)]
         metrics = calculate_suite_metrics(evals)
@@ -365,8 +398,61 @@ class TestEvaluatorAndCases(unittest.TestCase):
         self.assertEqual(metrics["task_success"]["task_success_rate"], 1.0)
 
     # -------------------------------------------------------------------------
-    # 4. Tracer Persistence Compatibility
+    # 4. Tracing Interface & End-to-End Suite Runs
     # -------------------------------------------------------------------------
+
+    def test_suite_evaluation_with_tracer(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+            db_path = tf.name
+
+        try:
+            init_db(db_path)
+            agent = SupportAgent(config=get_default_config())
+            report = run_suite_evaluation(agent=agent, db_path=db_path)
+
+            self.assertEqual(report.total_cases, 6)
+            self.assertEqual(report.passed_cases, 6)
+            self.assertEqual(report.failed_cases, 0)
+            self.assertEqual(report.metrics["task_success"]["passed_count"], 6)
+            self.assertEqual(report.metrics["task_success"]["total_cases"], 6)
+            self.assertEqual(report.metrics["safety_violations"]["violation_count"], 0)
+
+            # Verify runs were persisted and queryable via tracing interface
+            runs = list_runs(db_path)
+            self.assertEqual(len(runs), 6)
+        finally:
+            if os.path.exists(db_path):
+                os.remove(db_path)
+
+    def test_controlled_second_agent_baseline_comparison(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
+            db_path = tf.name
+
+        try:
+            init_db(db_path)
+            b_rep, c_rep, comp = run_baseline_comparison(db_path=db_path)
+
+            self.assertEqual(b_rep.total_cases, 6)
+            self.assertEqual(b_rep.passed_cases, 6)
+            self.assertEqual(b_rep.agent_version, "v1.0.0")
+
+            self.assertEqual(c_rep.total_cases, 6)
+            self.assertEqual(c_rep.agent_version, "v0.9.0-fastfail")
+
+            # Fast-fail configuration regresses on Case 1 and Case 6 due to step limits
+            self.assertEqual(comp.verdict, "REJECTED")
+            self.assertEqual(comp.safety_status, "PASS")
+            self.assertGreater(comp.regression_rate["regressed_count"], 0)
+            self.assertEqual(len(comp.case_comparisons), 6)
+
+            # Check comparison fields
+            case_1_comp = next(c for c in comp.case_comparisons if c["case_id"] == "CASE-001-ORDINARY")
+            self.assertEqual(case_1_comp["baseline_verdict"], "PASS")
+            self.assertEqual(case_1_comp["candidate_verdict"], "FAIL")
+            self.assertEqual(case_1_comp["delta_status"], "REGRESSION")
+        finally:
+            if os.path.exists(db_path):
+                os.remove(db_path)
 
     def test_evaluation_record_persistence(self):
         with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tf:
@@ -403,7 +489,19 @@ class TestEvaluatorAndCases(unittest.TestCase):
             if os.path.exists(db_path):
                 os.remove(db_path)
 
+    # -------------------------------------------------------------------------
+    # 5. App Formatting & Helpers
+    # -------------------------------------------------------------------------
+
+    def test_app_format_rate(self):
+        rate_dict = {"my_rate": 0.75, "passed": 3, "total": 4}
+        formatted = format_rate(rate_dict, "my_rate", "passed", "total")
+        self.assertEqual(formatted, "3/4 (75.0%)")
+
+        na_dict = {"my_rate": None, "passed": 0, "total": 0}
+        formatted_na = format_rate(na_dict, "my_rate", "passed", "total")
+        self.assertEqual(formatted_na, "N/A (0/0)")
+
 
 if __name__ == "__main__":
     unittest.main()
-
