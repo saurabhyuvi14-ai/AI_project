@@ -2,6 +2,8 @@
 
 from .diagnosis import (
     CaseExpectation,
+    DiagnosisEvidence,
+    DiagnosisLimitExceeded,
     DiagnosisRequest,
     DiagnosisResult,
     FailureCategory,
@@ -9,6 +11,9 @@ from .diagnosis import (
     RunInspection,
     TraceEvent,
     diagnose,
+    get_case_expectation,
+    get_failure_summary,
+    get_run_trace,
 )
 from .repair import (
     ApprovalStatus,
@@ -22,6 +27,8 @@ __all__ = [
     "ApprovalStatus",
     "CandidateTestStatus",
     "CaseExpectation",
+    "DiagnosisEvidence",
+    "DiagnosisLimitExceeded",
     "DiagnosisRequest",
     "DiagnosisResult",
     "FailureCategory",
@@ -31,5 +38,8 @@ __all__ = [
     "TraceEvent",
     "apply_candidate_to_copy",
     "diagnose",
+    "get_case_expectation",
+    "get_failure_summary",
+    "get_run_trace",
     "validate_candidate",
 ]

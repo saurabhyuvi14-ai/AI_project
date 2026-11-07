@@ -101,3 +101,23 @@ If a limit is reached, stop and mark the diagnosis or evaluation incomplete. An 
 6. Are the proposed diagnosis and evaluation time/call budgets appropriate for the actual test suite?
 7. Who may approve or reject a candidate, how is that decision recorded, and what exact mechanism promotes an approved settings-only change?
 8. What should happen when evidence is incomplete, evaluation is nondeterministic, or a run exceeds a limit? The proposal is to abstain or reject rather than infer success.
+
+## 10. Implemented diagnosis foundation
+
+The deterministic diagnosis component reads each selected run's stored trace,
+case expectation, and failure summary through the read-only interface in
+`agentops/diagnosis.py`. It supports missing information, unknown orders,
+malformed or incomplete tool results, timeouts, conflicting status values, and
+unsafe claims. Unsupported categories or categories without matching trace
+evidence result in abstention.
+
+Diagnosis results keep observed trace facts and cited evidence event IDs
+separate from hypotheses. Each evidence record includes its run ID and event
+ID; citations are validated against the inspected runs. The component is
+local-only and does not require an LLM or network access.
+
+The initial limits are four processing steps and three read-only tool calls per
+run, a 1,000-event trace limit per run, a two-second timeout per tool call, at
+most three selected runs, and a ten-second wall-clock limit per diagnosis.
+Repair generation and regression testing are not part of diagnosis, and
+diagnosis cannot modify a live agent.
