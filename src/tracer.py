@@ -103,8 +103,9 @@ _MIGRATIONS = {
 }
 
 
-def _connect(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+def _connect_readonly(db_path: str) -> sqlite3.Connection:
+    """Open an existing store read-only; read functions can never modify trace data."""
+    conn = sqlite3.connect(f"file:{os.path.abspath(db_path)}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -240,7 +241,9 @@ def save_run_trace(db_path: str, run: RunRecord, events: List[TraceEvent]) -> No
 
 def load_trace(db_path: str, run_id: str) -> tuple:
     """Return (RunRecord, list[TraceEvent]) ordered by sequence_no ASC."""
-    conn = _connect(db_path)
+    if not os.path.exists(db_path):
+        return (None, [])
+    conn = _connect_readonly(db_path)
     try:
         run_row = conn.execute(
             "SELECT * FROM runs WHERE run_id = ?", (run_id,)
@@ -270,24 +273,47 @@ def list_runs(
     case_id: Optional[str] = None,
     agent_version: Optional[str] = None,
     config_role: Optional[str] = None,
+    baseline_run_id: Optional[str] = None,
 ) -> List[RunRecord]:
-    """List stored runs (oldest first), optionally filtered by case, version, or config role."""
+    """
+    List stored runs (oldest first), optionally filtered by case, version, config role,
+    or the original run a candidate was compared against.
+    """
     if not os.path.exists(db_path):
         return []
     clauses, params = [], []
     for column, value in (
-        ("case_id", case_id), ("agent_version", agent_version), ("config_role", config_role)
+        ("case_id", case_id), ("agent_version", agent_version), ("config_role", config_role),
+        ("baseline_run_id", baseline_run_id),
     ):
         if value is not None:
             clauses.append(f"{column} = ?")
             params.append(value)
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
-    conn = _connect(db_path)
+    conn = _connect_readonly(db_path)
     try:
         rows = conn.execute(
             f"SELECT * FROM runs{where} ORDER BY start_time ASC, run_id ASC", params
         ).fetchall()
         return [_run_from_row(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def list_evaluations(db_path: str, run_id: Optional[str] = None) -> List[EvaluationRecord]:
+    """List stored evaluations (oldest first), optionally for one run."""
+    if not os.path.exists(db_path):
+        return []
+    where, params = ("WHERE run_id = ?", (run_id,)) if run_id is not None else ("", ())
+    conn = _connect_readonly(db_path)
+    try:
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "evaluations" not in tables:
+            return []
+        rows = conn.execute(
+            f"SELECT * FROM evaluations {where} ORDER BY created_at ASC, eval_id ASC", params
+        ).fetchall()
+        return [EvaluationRecord(**{key: row[key] for key in row.keys()}) for row in rows]
     finally:
         conn.close()
 
