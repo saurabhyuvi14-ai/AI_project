@@ -32,6 +32,7 @@ from src.evaluation import (
     calculate_safety_violations,
     calculate_failure_localization_accuracy,
     calculate_regression_failure_rate,
+    calculate_repair_success,
     calculate_suite_metrics,
     run_suite_evaluation,
     compare_agents,
@@ -387,6 +388,36 @@ class TestEvaluatorAndCases(unittest.TestCase):
         self.assertEqual(rfr["baseline_passed_count"], 2)
         self.assertEqual(rfr["regression_rate"], 0.5)
 
+    def test_calculate_repair_success(self):
+        baseline_evals = [
+            EvaluationResult("b1", "r1", "c1", "PASS", True, 1.0),
+            EvaluationResult("b2", "r2", "c2", "FAIL", False, 0.0),
+            EvaluationResult("b3", "r3", "c3", "FAIL", False, 0.0),
+        ]
+        # Candidate repairs c2, leaves c3 failing
+        candidate_evals = [
+            EvaluationResult("c1", "r1", "c1", "PASS", True, 1.0),
+            EvaluationResult("c2", "r2", "c2", "PASS", True, 1.0),
+            EvaluationResult("c3", "r3", "c3", "FAIL", False, 0.0),
+        ]
+        rsr = calculate_repair_success(baseline_evals, candidate_evals)
+        self.assertEqual(rsr["repaired_count"], 1)
+        self.assertEqual(rsr["targeted_failing_count"], 2)
+        self.assertEqual(rsr["repair_success_rate"], 0.5)
+
+        # Targeted subset check
+        rsr_targeted = calculate_repair_success(baseline_evals, candidate_evals, targeted_case_ids={"c2"})
+        self.assertEqual(rsr_targeted["repaired_count"], 1)
+        self.assertEqual(rsr_targeted["targeted_failing_count"], 1)
+        self.assertEqual(rsr_targeted["repair_success_rate"], 1.0)
+
+        # Zero baseline failing cases
+        all_pass_baseline = [EvaluationResult("b1", "r1", "c1", "PASS", True, 1.0)]
+        rsr_zero = calculate_repair_success(all_pass_baseline, candidate_evals)
+        self.assertIsNone(rsr_zero["repair_success_rate"])
+        self.assertEqual(rsr_zero["repaired_count"], 0)
+        self.assertEqual(rsr_zero["targeted_failing_count"], 0)
+
     def test_suite_metrics_aggregation(self):
         evals = [EvaluationResult("e1", "r1", "CASE-001-ORDINARY", "PASS", True, 1.0)]
         metrics = calculate_suite_metrics(evals)
@@ -396,6 +427,13 @@ class TestEvaluatorAndCases(unittest.TestCase):
         self.assertIn("safety_violations", metrics)
         self.assertIn("failure_localization", metrics)
         self.assertEqual(metrics["task_success"]["task_success_rate"], 1.0)
+
+        # With baseline comparison metrics
+        baseline_evals = [EvaluationResult("b1", "r0", "CASE-001-ORDINARY", "FAIL", False, 0.0)]
+        metrics_with_base = calculate_suite_metrics(evals, baseline_evaluations=baseline_evals)
+        self.assertIn("repair_success", metrics_with_base)
+        self.assertIn("regression_failures", metrics_with_base)
+        self.assertEqual(metrics_with_base["repair_success"]["repaired_count"], 1)
 
     # -------------------------------------------------------------------------
     # 4. Tracing Interface & End-to-End Suite Runs

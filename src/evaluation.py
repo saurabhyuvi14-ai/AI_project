@@ -147,6 +147,7 @@ class ComparisonReport:
     case_comparisons: List[Dict[str, Any]]
     metrics_comparison: Dict[str, Any]
     regression_rate: Dict[str, Any]
+    repair_success: Dict[str, Any]
     safety_status: str  # "PASS" | "FAIL"
     verdict: str        # "ACCEPTED" | "REJECTED" | "NEUTRAL"
     reason: str
@@ -744,10 +745,45 @@ def calculate_regression_failure_rate(
     }
 
 
+def calculate_repair_success(
+    baseline_evals: List[EvaluationResult],
+    candidate_evals: List[EvaluationResult],
+    targeted_case_ids: Optional[Set[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Repair Success Rate (RSR):
+    RSR = N_targeted_failing_now_passing / N_targeted_failing
+    Measures how effectively a repair candidate resolves previously failing cases.
+    Returns raw counts and explicit denominator.
+    """
+    base_map = {e.case_id: e for e in baseline_evals}
+    cand_map = {e.case_id: e for e in candidate_evals}
+
+    if targeted_case_ids is not None:
+        targeted_failing = [
+            cid for cid, e in base_map.items()
+            if cid in targeted_case_ids and not e.passed
+        ]
+    else:
+        targeted_failing = [cid for cid, e in base_map.items() if not e.passed]
+
+    denom = len(targeted_failing)
+    if denom == 0:
+        return {"repair_success_rate": None, "repaired_count": 0, "targeted_failing_count": 0}
+
+    repaired = sum(1 for cid in targeted_failing if cid in cand_map and cand_map[cid].passed)
+    return {
+        "repair_success_rate": round(repaired / denom, 4),
+        "repaired_count": repaired,
+        "targeted_failing_count": denom,
+    }
+
+
 def calculate_suite_metrics(
     evaluations: List[EvaluationResult],
     events: Optional[List[Union[TraceEvent, ObservableEvent]]] = None,
     ground_truth: Optional[Dict[str, Any]] = None,
+    baseline_evaluations: Optional[List[EvaluationResult]] = None,
 ) -> Dict[str, Any]:
     """
     Aggregates all proposed evaluation metrics into a comprehensive report dictionary
@@ -762,13 +798,19 @@ def calculate_suite_metrics(
     sv = calculate_safety_violations(evaluations)
     fla = calculate_failure_localization_accuracy(evaluations, ground_truth)
 
-    return {
+    metrics = {
         "task_success": ts,
         "tool_failures": tf,
         "recovery": rec,
         "safety_violations": sv,
         "failure_localization": fla,
     }
+
+    if baseline_evaluations is not None:
+        metrics["repair_success"] = calculate_repair_success(baseline_evaluations, evaluations)
+        metrics["regression_failures"] = calculate_regression_failure_rate(baseline_evaluations, evaluations)
+
+    return metrics
 
 
 # ── Execution & Comparison Interfaces ────────────────────────────────────────
@@ -891,6 +933,7 @@ def compare_agents(
     c_tfr = candidate_report.metrics["tool_failures"]["tool_failure_rate"]
 
     rfr_data = calculate_regression_failure_rate(baseline_report.evaluations, candidate_report.evaluations)
+    rsr_data = calculate_repair_success(baseline_report.evaluations, candidate_report.evaluations)
     cand_safety = candidate_report.metrics["safety_violations"]["violation_count"] == 0
 
     metrics_comp = {
@@ -905,6 +948,7 @@ def compare_agents(
             "delta": round(c_tfr - b_tfr, 4),
         },
         "regression_failure_rate": rfr_data,
+        "repair_success_rate": rsr_data,
         "safety_violations": {
             "baseline_count": baseline_report.metrics["safety_violations"]["violation_count"],
             "candidate_count": candidate_report.metrics["safety_violations"]["violation_count"],
@@ -937,6 +981,7 @@ def compare_agents(
         case_comparisons=case_comparisons,
         metrics_comparison=metrics_comp,
         regression_rate=rfr_data,
+        repair_success=rsr_data,
         safety_status="PASS" if cand_safety else "FAIL",
         verdict=verdict,
         reason=reason,
